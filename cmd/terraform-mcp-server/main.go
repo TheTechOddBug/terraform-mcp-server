@@ -34,6 +34,7 @@ import (
 
 //go:embed instructions.md
 var instructions string
+var sessionClientInfo sync.Map // map[string]client.ClientInfo
 
 func runHTTPServer(logger *log.Logger, host string, port string, endpointPath string, heartbeatInterval time.Duration, enabledToolsets []string, metricsConfig client.MetricsConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -45,6 +46,8 @@ func runHTTPServer(logger *log.Logger, host string, port string, endpointPath st
 		client.NewSessionHandler(ctx, session, logger)
 	})
 	hooks.AddOnUnregisterSession(func(ctx context.Context, session server.ClientSession) {
+		// Clean up client info populated in the metrics hooks, for the session
+		sessionClientInfo.Delete(session.SessionID())
 		client.EndSessionHandler(ctx, session, logger)
 	})
 	// When running multiple sessions of the MCP server (load balancing), calling client.NewSessionHandler
@@ -78,10 +81,51 @@ func attachMetricsHooks(hooks *server.Hooks, metricsConfig client.MetricsConfig,
 	if !metricsConfig.Enabled {
 		return
 	}
+	hooks.AddAfterInitialize(func(ctx context.Context, id any, message *mcp.InitializeRequest, result *mcp.InitializeResult) {
+		if message != nil && message.Params.ClientInfo.Name != "" {
+			session := server.ClientSessionFromContext(ctx)
+			if session == nil {
+				logger.Debug("AddAfterInitialize hook: No session found in context")
+				return
+			}
+			ci := client.ClientInfo{
+				Name:        message.Params.ClientInfo.Name,
+				Version:     message.Params.ClientInfo.Version,
+				Title:       message.Params.ClientInfo.Title,
+				Description: message.Params.ClientInfo.Description,
+			}
+			// Record the client info in the session first so we can reuse it in the BeforeToolCall hook
+			sessionClientInfo.Store(session.SessionID(), ci)
+			// Record the metric
+			client.RecordClientType(ctx, ci, metricsConfig, logger)
+		}
+	})
 
 	var toolStartTimes sync.Map
 	hooks.AddBeforeCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest) {
 		toolStartTimes.Store(fmt.Sprintf("%v", id), time.Now())
+		session := server.ClientSessionFromContext(ctx)
+		if session == nil {
+			logger.Debug("AddBeforeCallTool hook: No session found in context")
+			return
+		}
+		value, ok := sessionClientInfo.Load(session.SessionID())
+		if !ok {
+			logger.Debugf("AddBeforeCallTool hook: Client info not found for session ID: %s", session.SessionID())
+			return
+		}
+		// Read the client info recorded in the AddAfterInitialize hook
+		info, ok := value.(client.ClientInfo)
+		if !ok || info.Name == "" {
+			logger.Debugf("AddBeforeCallTool hook: Unable to read client info for sessionID %s from sessionClientInfo map", session.SessionID())
+			return
+		}
+		client.RecordClientType(
+			ctx,
+			info,
+			metricsConfig,
+			logger,
+		)
 	})
 	hooks.AddAfterCallTool(func(ctx context.Context, id any, message *mcp.CallToolRequest, result any) {
 		startTime := time.Now()
@@ -391,6 +435,12 @@ func initMetrics(ctx context.Context, config *client.MetricsConfig, logger *log.
 		metric.WithUnit("s"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create latency histogram: %w", err)
+	}
+
+	config.ClientTypeCounter, err = meter.Int64Counter("mcp_client_type_total",
+		metric.WithDescription("Total number of connections by client type"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client type counter: %w", err)
 	}
 
 	return func() {

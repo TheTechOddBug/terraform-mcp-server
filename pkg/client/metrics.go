@@ -24,6 +24,14 @@ type MetricsConfig struct {
 	ToolCounter           metric.Int64Counter      // ToolCounter tracks the total number of tool calls initiated
 	ErrorCounter          metric.Int64Counter      // Error count
 	ToolCallLatencyBucket metric.Float64Histogram  // Latency distribution
+	ClientTypeCounter     metric.Int64Counter      // Client type count (e.g. cli, cpi, vscode, web etc.)
+}
+
+type ClientInfo struct {
+	Name        string
+	Version     string
+	Title       string
+	Description string
 }
 
 func DefaultMetricsConfig() MetricsConfig {
@@ -82,7 +90,7 @@ func LoadMetricsConfigFromEnv() MetricsConfig {
 func RecordToolCall(ctx context.Context, startTime time.Time, toolErr bool, id any, message *mcp.CallToolRequest, config MetricsConfig, logger *log.Logger) {
 	logger.Infof("Recording tool call for tool: %s id: %v", message.Params.Name, id)
 	if !config.Enabled || config.ToolCounter == nil {
-		logger.Errorf("DEBUG: Either metrics are not enabled or ToolCounter is NIL! Initialization failed.")
+		logger.Debugf("Either metrics are not enabled or ToolCounter is NIL! Initialization failed.")
 		return
 	}
 	// Calculate latency
@@ -102,4 +110,22 @@ func RecordToolCall(ctx context.Context, startTime time.Time, toolErr bool, id a
 		config.ErrorCounter.Add(ctx, 1, attrs)
 		logger.Errorf("Recorded error for tool %s", message.Params.Name)
 	}
+}
+
+// RecordClientType records the type and version of the client making the tool call (e.g., CLI, VSCode, Web, etc.)
+func RecordClientType(ctx context.Context, ci ClientInfo, config MetricsConfig, logger *log.Logger) {
+	logger.Infof("Recording client type for client: %s version: %s title: %s description: %s", ci.Name, ci.Version, ci.Title, ci.Description)
+	if !config.Enabled || config.ClientTypeCounter == nil {
+		logger.Debugf("Either metrics are not enabled or ClientTypeCounter is NIL! Initialization failed.")
+		return
+	}
+	attrs := metric.WithAttributes(
+		attribute.String("client.name", ci.Name),
+		attribute.String("client.version", ci.Version),
+		attribute.String("client.title", ci.Title),
+		attribute.String("client.description", ci.Description),
+		attribute.String("service.name", config.ServiceName),
+		attribute.String("service.version", config.ServiceVersion),
+	)
+	config.ClientTypeCounter.Add(ctx, 1, attrs)
 }
